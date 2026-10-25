@@ -12,6 +12,7 @@ const environmentType = z.object({
   ALLOW_UPDATES: z.string().transform(value => value.toLowerCase().trim() === 'true'),
 
   API_PORT: z.string().default('31116').transform(value => Number.parseInt(value)),
+  BIND_HOST: z.string().default('127.0.0.1'),
 
   AUDIO_METADATA_URLS: z.string().default('').transform(urls => urls.split(',').filter(Boolean)),
 
@@ -27,6 +28,7 @@ const environmentType = z.object({
 
   SENTRY_DSN: z.url().default('https://test@o0.ingest.sentry.io/0'),
   STT_GIGAAM_URL: z.url().default('ws://10.0.3.137:8080'),
+  STT_FLUSH_ON_FINISH: z.string().default('false').transform(value => value === 'true'),
   TTS_OPENAI_API_KEY: z.string().default(''),
   TTS_OPENAI_BASE_URL: z.url().default('http://10.0.3.137:8000'),
   TTS_OPENAI_MODEL: z.string().default(''),

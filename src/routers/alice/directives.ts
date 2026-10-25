@@ -20,7 +20,11 @@ export interface DirectiveFunctionProvider {
 }
 
 export type InternalDirective = MusicDirective<'next_track'> | MusicDirective<'play'> | MusicDirective<'previous_track'> |
-  MusicDirective<'recover_next_track'> | MusicDirective<'stop'> | MusicRecoverCommitDirective
+  MusicDirective<'recover_next_track'> | MusicDirective<'stop'> | MusicRecoverCommitDirective | MusicSeekDirective
+
+export interface MusicSeekDirective extends MusicDirective<'seek'> {
+  positionMs: number
+}
 
 export interface MusicDirective<T extends string> {
   type: `music_${T}`

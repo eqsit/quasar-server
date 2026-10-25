@@ -4,7 +4,7 @@ import { ProcessorBackend, ProcessorPartialResponse, ProcessorSession } from '..
 import { getLogger } from '../../logger'
 import { Notifier } from '../../notifier'
 import proto from '../../protos/protos'
-import { textToDirectiveMap } from '../alice/base-provider'
+import { textToDirectiveMap, musicShortcuts, musicSeekShortcut, normalizeCommand } from '../alice/base-provider'
 import { DirectiveFunctionProvider, mmSemanticFrame, ttsPlayPlaceholderDirective, WrappedDirective } from '../alice/directives'
 import { continueSessionStage1SemanticFrame } from '../alice/typed-payloads'
 
@@ -19,6 +19,7 @@ export interface InputHandlerProperties {
 
 export type InputMetadata = Omit<object, 'deviceState'> & {
   deviceState?: proto.NAlice.NAliceApi.ITDeviceState
+  deviceId?: string
 }
 
 export interface InputResult {
@@ -56,7 +57,8 @@ export type VoiceInput = Input & {
   text: string
 }
 
-const MAX_WAIT = 5000
+// Buffered HTTP providers return a final answer rather than continuation callbacks.
+const MAX_WAIT = 45000
 
 export class InputHandler {
   private readonly logger = getLogger()
@@ -65,16 +67,22 @@ export class InputHandler {
   private requestSent: boolean = false
   private session: null | ProcessorSession = null
   private span: Span | undefined
+  private sessionGeneration = 0
+  private openingSession: Promise<void> | null = null
 
   constructor (private readonly properties: InputHandlerProperties) {}
 
   closeSession (closePartially?: boolean): void {
+    this.sessionGeneration++
+    this.openingSession = null
+    this.notifier.notifyAll()
     if (this.session) {
       if (!closePartially) {
         this.partialResponses = []
       }
-      this.session.close()
+      const session = this.session
       this.session = null
+      session.close()
       this.requestSent = false
       this.logger.debug('Session closed')
       this.span?.end()
@@ -107,31 +115,40 @@ export class InputHandler {
   }
 
   async openSession (parentSpan?: Span): Promise<void> {
-    if (this.session) {
-      this.logger.debug('Session already opened')
-    } else {
-      if (parentSpan) {
-        this.span = startInactiveSpan({
-          name: 'InputHandler session processing',
-          op: 'input-handler-session',
-          parentSpan
-        })
-      }
-      this.logger.debug('Opening new session')
-      this.partialResponses = []
-      this.session = await this.properties.processor.openSession(parentSpan)
-      this.session.addListener('close', () => {
-        this.closeSession(true)
-      })
-      this.session.addListener('partialResponse', data => {
-        this.logger.debug(`Received partial response: ${JSON.stringify(data)}`)
-        this.partialResponses.push(data)
-        this.notifier.notifyAll()
-      })
-      this.session.addListener('partialResponse', () => {})
-      await this.session.prepare(this.properties.directiveFunctionProvider.getSupportedFunctions())
-      this.logger.debug('Session opened')
+    if (this.session) return
+    if (this.openingSession) return await this.openingSession
+    const generation = this.sessionGeneration
+    const pending = this.startSession(parentSpan, generation)
+    this.openingSession = pending
+    try {
+      await pending
+    } catch (error) {
+      if (generation === this.sessionGeneration) throw error
+    } finally {
+      if (this.openingSession === pending) this.openingSession = null
     }
+  }
+
+  private async startSession (parentSpan: Span | undefined, generation: number): Promise<void> {
+    const session = await this.properties.processor.openSession(parentSpan)
+    if (generation !== this.sessionGeneration) {
+      session.close()
+      return
+    }
+    if (parentSpan) {
+      this.span = startInactiveSpan({ name: 'InputHandler session processing', op: 'input-handler', parentSpan })
+    }
+    this.partialResponses = []
+    this.session = session
+    session.addListener('close', () => {
+      if (this.session === session) this.closeSession(true)
+    })
+    session.addListener('partialResponse', data => {
+      if (this.session !== session || generation !== this.sessionGeneration) return
+      this.partialResponses.push(data)
+      this.notifier.notifyAll()
+    })
+    await session.prepare(this.properties.directiveFunctionProvider.getSupportedFunctions())
   }
 
   async processTextInput (input: TextInput, parentSpan?: Span, dialogSpan?: Span): Promise<InputResult> {
@@ -190,15 +207,13 @@ export class InputHandler {
         }
       }
       case 'text': {
-        const directive = textToDirectiveMap[input.data.text]
+        const command = normalizeCommand(input.data.text)
+        const directive = textToDirectiveMap[command] ?? this.musicShortcut(command, input.metadata)
         if (!directive) {
-          this.logger.warn(`Received text TextInput with unknown text: '${input.data.text}'`)
-          return {
-            dialogFinished: true,
-            directives: [],
-            shouldListen: false,
-            text: null
-          }
+          if (!this.session) await this.openSession(dialogSpan)
+          await this.session!.process({ metadata: input.metadata, text: input.data.text })
+          this.requestSent = true
+          return await this.getPartialResponseResult(parentSpan)
         }
 
         return {
@@ -223,6 +238,8 @@ export class InputHandler {
 
   async processVoiceInput (input: VoiceInput, parentSpan?: Span): Promise<InputResult> {
     this.logger.debug(`Received VoiceInput: ${input.text}`)
+    const shortcut = this.musicShortcut(normalizeCommand(input.text), input.metadata)
+    if (shortcut) return { dialogFinished: true, directives: [shortcut], shouldListen: false, text: null }
     if (!this.session) {
       this.logger.warn('No session opened')
       return {
@@ -240,6 +257,13 @@ export class InputHandler {
     })
     this.requestSent = true
     return await this.getPartialResponseResult(parentSpan)
+  }
+
+  private musicShortcut (command: string, metadata: InputMetadata): WrappedDirective | undefined {
+    const states = proto.NAlice.NAliceApi.TDeviceState.TAudioPlayer.TPlayerState
+    const state = metadata.deviceState?.AudioPlayer?.PlayerState
+    if (state !== states.Playing && state !== states.Buffering && state !== states.Paused) return undefined
+    return musicShortcuts[command] ?? musicSeekShortcut(command)
   }
 
   private async getPartialResponseResult (parentSpan?: Span): Promise<InputResult> {
@@ -296,10 +320,10 @@ export class InputHandler {
           ...(partialResponse.directives.map(directive =>
             this.properties.directiveFunctionProvider
               .convertToWrappedDirective(directive)).filter(Boolean) as WrappedDirective[]),
-          ttsPlayPlaceholderDirective()
+          ...(partialResponse.text.trim() ? [ttsPlayPlaceholderDirective()] : [])
         ],
         shouldListen: partialResponse.shouldListen,
-        text: partialResponse.text
+        text: partialResponse.text.trim() ? partialResponse.text : null
       }
     }
 

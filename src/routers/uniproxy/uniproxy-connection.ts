@@ -59,6 +59,7 @@ export class UniProxyConnection {
   private voiceInputReferenceSequenceNumber: number = -1
 
   private voiceInputStreamId: Long | number = -1
+  private inputGeneration = 0
 
   constructor (private readonly webSocket: WebSocket,
     private readonly deviceId: string,
@@ -96,6 +97,17 @@ export class UniProxyConnection {
               rawDirectives.push(audioPlayDirective(track,
                 this.parameters.musicManager.getLastSavedPosition(this.deviceId)).quasarDirective,
               stackRecoverNextTrackDirective.quasarDirective)
+            }
+            break
+          }
+          case 'music_seek': {
+            const position = Math.max(0, Math.round(directive.internalDirective.positionMs))
+            this.parameters.musicManager.savePosition(this.deviceId, position)
+            this.parameters.musicManager.invalidateLookahead(this.deviceId)
+            if (metadata?.deviceState?.AudioPlayer?.PlayerState !== 3) {
+              const track = await this.parameters.musicManager.getCurrentTrack(this.deviceId)
+              if (track) rawDirectives.push(audioPlayDirective(track, position).quasarDirective,
+                stackRecoverNextTrackDirective.quasarDirective)
             }
             break
           }
@@ -204,6 +216,7 @@ export class UniProxyConnection {
   }
 
   private handleClientCancel (): void {
+    this.inputGeneration++
     this.inputSpan?.setAttribute('endReason', 'clientCancel')
     this.inputSpan?.end()
     this.inputSpan = undefined
@@ -234,6 +247,7 @@ export class UniProxyConnection {
   }
 
   private async handleClose (): Promise<void> {
+    this.inputGeneration++
     this.inputHandler.closeSession()
     this.closeDialog(CloseDialogReason.WEBSOCKET_CLOSE)
     this.voiceInputHandler.close()
@@ -286,6 +300,7 @@ export class UniProxyConnection {
   }
 
   private handleServerCancel (): void {
+    this.inputGeneration++
     this.inputHandler.closeSession()
     this.voiceInputHandler.handleVoiceInputCancelEvent({})
 
@@ -307,8 +322,14 @@ export class UniProxyConnection {
       return
     }
 
+    if (clientMessage.StreamControl!.SpotterEnd) {
+      this.logger.info('Voice stream wake word ended')
+      await this.voiceInputHandler.handleSpotterEndEvent()
+      return
+    }
+
     const closeReason = clientMessage.StreamControl!.Close?.Reason
-    if (!closeReason) {
+    if (closeReason == null) {
       return
     }
 
@@ -332,6 +353,7 @@ export class UniProxyConnection {
     const event = clientMessage.Event!.TextInput!.Request!.Event!
 
     const metadata = {
+      deviceId: this.deviceId,
       deviceState: proto.NAlice.NAliceApi.TDeviceState.decode(
         clientMessage.Event!.TextInput!.Request!.DeviceStateRaw!)
     }
@@ -345,6 +367,10 @@ export class UniProxyConnection {
           },
           metadata
         }
+      } else if (getValue(payload, 'any', 'typed_semantic_frame', 'player_next_track_semantic_frame')) {
+        textInput = { data: { kind: 'text', text: 'следующий трек' }, metadata }
+      } else if (getValue(payload, 'any', 'typed_semantic_frame', 'player_prev_track_semantic_frame')) {
+        textInput = { data: { kind: 'text', text: 'предыдущий трек' }, metadata }
       } else if (getValue(payload, 'string', 'typed_semantic_frame', 'external_event_semantic_frame', 'event')) {
         textInput = {
           data: {
@@ -406,6 +432,14 @@ export class UniProxyConnection {
           },
           metadata
         }
+      } else if (decoded?.TypedSemanticFrame?.PlayerNextTrackSemanticFrame) {
+        textInput = { data: { kind: 'text', text: 'следующий трек' }, metadata }
+      } else if (decoded?.TypedSemanticFrame?.PlayerPrevTrackSemanticFrame) {
+        textInput = { data: { kind: 'text', text: 'предыдущий трек' }, metadata }
+      } else if (decoded?.TypedSemanticFrame?.SoundLouderSemanticFrame) {
+        textInput = { data: { kind: 'text', text: 'громче' }, metadata }
+      } else if (decoded?.TypedSemanticFrame?.SoundQuiterSemanticFrame) {
+        textInput = { data: { kind: 'text', text: 'тише' }, metadata }
       } else {
         this.logger.info(`Received unknown TextInput semantic frame: ${JSON.stringify(decoded)} ${JSON.stringify(event)}`)
       }
@@ -424,6 +458,7 @@ export class UniProxyConnection {
     if (textInput === null) {
       return
     }
+    const generation = ++this.inputGeneration
 
     if (!dialogId || dialogId !== this.dialogId) {
       this.closeDialog(CloseDialogReason.INTERRUPTION)
@@ -442,10 +477,13 @@ export class UniProxyConnection {
       inputResult = await this.inputHandler.processTextInput(textInput,
         this.inputSpan ?? this.dialogSpan, this.dialogSpan)
     } catch (error) {
+      if (generation !== this.inputGeneration) return
       this.logger.warn('Failed to processTextInput on InputHandler: ', error)
       this.handleServerCancel()
       return
     }
+
+    if (generation !== this.inputGeneration) return
 
     try {
       await this.sendInputResult(inputResult, metadata, clientMessage.Event!.TextInput!.Header!.RequestId!,
@@ -454,6 +492,8 @@ export class UniProxyConnection {
       this.logger.warn('Failed to send input result: ', error)
       this.closeConnection()
     }
+
+    if (generation !== this.inputGeneration) return
 
     this.inputSpan?.setAttribute('result', JSON.stringify(inputResult, undefined, 2))
     this.inputSpan?.setAttribute('endReason', 'finish')
@@ -471,6 +511,7 @@ export class UniProxyConnection {
   }
 
   private async handleVoiceInputEvent (clientMessage: TClientMessage): Promise<void> {
+    this.inputGeneration++
     const voiceInputHeader = clientMessage.Event!.VoiceInput!.Header!
     const eventHeader = clientMessage.Event!.Header!
     if (!voiceInputHeader.DialogId || voiceInputHeader.DialogId !== this.dialogId) {
@@ -494,6 +535,7 @@ export class UniProxyConnection {
     this.voiceInputReferenceSequenceNumber = voiceInputHeader.SequenceNumber!
     this.voiceInputHandler.handleVoiceInputEvent({
       metadata: {
+        deviceId: this.deviceId,
         deviceState: proto.NAlice.NAliceApi.TDeviceState.decode(
           clientMessage.Event!.VoiceInput!.Request!.DeviceStateRaw!)
       },
@@ -616,8 +658,10 @@ export class UniProxyConnection {
 
   private async sendInputResult (result: InputResult, metadata: InputMetadata, requestId: string,
     referenceMessageId: string, sequenceNumber: number): Promise<void> {
+    const generation = this.inputGeneration
     try {
       const rawDirectives = await this.processWrappedDirectives(result.directives, metadata)
+      if (generation !== this.inputGeneration) return
       await this.sendAliceResponse(result.text, rawDirectives, result.shouldListen,
         requestId, referenceMessageId, sequenceNumber)
     } catch (error) {
@@ -646,6 +690,7 @@ export class UniProxyConnection {
       try {
         if (result.text !== '') {
           const ttsResult = await this.parameters.tts.synthesize({
+            deviceId: this.deviceId,
             parentSpan: span ?? this.inputSpan ?? this.dialogSpan,
             text: result.text
           })
@@ -656,6 +701,8 @@ export class UniProxyConnection {
       }
 
       span?.end()
+
+      if (generation !== this.inputGeneration) return
 
       this.logger.info(`Synthesized: ${audioData.length}`)
 
@@ -740,6 +787,10 @@ export class UniProxyConnection {
 
   private setupVoiceInputHandlers (): void {
     this.voiceInputHandler.on('finish', async event => {
+      const generation = this.inputGeneration
+      const requestId = this.voiceInputReferenceRequestId
+      const messageId = this.voiceInputReferenceMessageId
+      const sequenceNumber = this.voiceInputReferenceSequenceNumber
       this.voiceInputStreamId = -1
 
       try {
@@ -758,19 +809,23 @@ export class UniProxyConnection {
           text: event.text
         }, this.inputSpan ?? this.dialogSpan)
       } catch (error) {
+        if (generation !== this.inputGeneration) return
         this.logger.warn('Failed to processVoiceInput on InputHandler: ', error)
         this.handleServerCancel()
         return
       }
 
+      if (generation !== this.inputGeneration) return
+
       try {
-        await this.sendInputResult(inputResult, event.metadata, this.voiceInputReferenceRequestId,
-          this.voiceInputReferenceMessageId, this.voiceInputReferenceSequenceNumber)
+        await this.sendInputResult(inputResult, event.metadata, requestId, messageId, sequenceNumber)
       } catch (error) {
         this.logger.warn('Failed to send input result: ', error)
         this.closeConnection()
         return
       }
+
+      if (generation !== this.inputGeneration) return
 
       this.inputSpan?.setAttribute('result', JSON.stringify(inputResult, undefined, 2))
       this.inputSpan?.setAttribute('endReason', 'finish')

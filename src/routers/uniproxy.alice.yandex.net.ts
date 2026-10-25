@@ -1,5 +1,5 @@
 import { Server } from 'node:http'
-import { Server as WSServer } from 'ws'
+import { WebSocketServer } from 'ws'
 
 import { getLogger } from '../logger'
 import { UniProxyConnection, UniProxyConnectionParameters } from './uniproxy/uniproxy-connection'
@@ -8,22 +8,32 @@ const logger = getLogger()
 
 interface UniProxyRouter {
   connections: Map<string, Set<UniProxyConnection>>
+  close(): void
 }
 
 export function registerUniproxyAliceYandexNetRouter (parameters: UniProxyConnectionParameters,
   server: Server): UniProxyRouter {
-  const wsServer = new WSServer({ noServer: true })
+  const wsServer = new WebSocketServer({ noServer: true })
 
   server.on('upgrade', (request, socket, head) => {
-    if (request.url === '/uniproxy.alice.yandex.net/uni.ws') {
+    const pathname = new URL(request.url ?? '/', 'http://localhost').pathname
+    if (pathname === '/uniproxy.alice.yandex.net/uni.ws') {
       wsServer.handleUpgrade(request, socket, head, client => {
         wsServer.emit('connection', client, request)
       })
+    } else {
+      logger.warn(`Unsupported WebSocket path: ${pathname}`)
+      socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n')
+      socket.destroy()
     }
   })
 
   const router: UniProxyRouter = {
-    connections: new Map()
+    connections: new Map(),
+    close () {
+      for (const client of wsServer.clients) client.terminate()
+      wsServer.close()
+    }
   }
 
   wsServer.on('connection', (websocket, request) => {

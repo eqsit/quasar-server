@@ -15,8 +15,12 @@ class GigaAMSTTSession extends STTBackendSession {
   private readonly opusProcessor: OpusProcessor
   private spanEnded = false
   private stopped = false
+  private completed = false
+  private finishResolve?: () => void
+  private finishReject?: (error: Error) => void
 
-  constructor (private readonly webSocket: WebSocket, private readonly span?: Span) {
+  constructor (private readonly webSocket: WebSocket, private readonly span?: Span,
+    private readonly flushOnFinish = false) {
     super()
     this.opusProcessor = new OpusProcessor(
       data => this.send(data, true),
@@ -27,6 +31,10 @@ class GigaAMSTTSession extends STTBackendSession {
       if (this.stopped) return
       const simplifiedMessage = Array.isArray(message) ? Buffer.concat(message) : Buffer.from(message as ArrayBuffer)
       const response = JSON.parse(simplifiedMessage.toString('utf8')) as GigaAMMessage
+      if (response.end_of_utt) {
+        this.completed = true
+        this.finishResolve?.()
+      }
       if (!this.stopped) {
         this.chunkTranscribed({
           endOfUtt: response.end_of_utt,
@@ -35,8 +43,33 @@ class GigaAMSTTSession extends STTBackendSession {
       }
     })
     webSocket.on('close', () => {
+      this.finishReject?.(new Error('STT connection closed before final transcription'))
       this.stopped = true
     })
+  }
+
+  override async finish (): Promise<void> {
+    if (!this.flushOnFinish || this.completed) return
+    if (this.stopped) throw new Error('STT connection is closed')
+    let timer: ReturnType<typeof setTimeout>
+    try {
+      await new Promise<void>((resolve, reject) => {
+        this.finishResolve = resolve
+        this.finishReject = reject
+        timer = setTimeout(() => reject(new Error('STT final transcription timed out')), 45000)
+        this.webSocket.send(JSON.stringify({ type: 'finish' }), error => {
+          if (error) reject(error)
+        })
+      })
+    } finally {
+      clearTimeout(timer!)
+      this.finishResolve = undefined
+      this.finishReject = undefined
+    }
+  }
+
+  override async markSpotterEnd (): Promise<void> {
+    if (this.flushOnFinish) await this.send(JSON.stringify({ type: 'spotter_end' }), false)
   }
 
   close (): void {
@@ -72,7 +105,7 @@ class GigaAMSTTSession extends STTBackendSession {
 }
 
 export class GigaAMSTTBackend implements STTBackend {
-  constructor (private readonly endpoint: string) {}
+  constructor (private readonly endpoint: string, private readonly flushOnFinish = false) {}
 
   startTranscribing (parentSpan?: Span): Promise<STTBackendSession> {
     let span: Span | undefined
@@ -106,7 +139,7 @@ export class GigaAMSTTBackend implements STTBackend {
       })
       webSocket.on('open', () => {
         opened = true
-        resolve(new GigaAMSTTSession(webSocket, span))
+        resolve(new GigaAMSTTSession(webSocket, span, this.flushOnFinish))
       })
     })
   }

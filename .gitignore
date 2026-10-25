@@ -2,3 +2,13 @@
 .idea/
 node_modules/
 .env.local
+dist/
+secrets/
+.venv/
+__pycache__/
+deploy/*.log
+deploy/*.ogg
+backups/
+deploy/test-*.json
+deploy/*.pcm
+deploy/services-staging/

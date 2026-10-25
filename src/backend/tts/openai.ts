@@ -28,7 +28,7 @@ export class OpenAITTSBackend implements TTSBackend {
         response_format: 'opus',
         speed: this.parameters.speed,
         voice: this.parameters.voice,
-      })
+      }, request.deviceId ? { headers: { 'x-quasar-device-id': request.deviceId } } : undefined)
       return {
         format: 'audio/opus',
         voiceOutput: Buffer.from(await result.arrayBuffer()),

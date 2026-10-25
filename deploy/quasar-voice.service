@@ -1,0 +1,24 @@
+[Unit]
+Description=Quasar voice STT, processor and TTS API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=quasar
+Group=quasar
+WorkingDirectory=/opt/quasar-server
+StateDirectory=quasar-voice
+StateDirectoryMode=0700
+EnvironmentFile=/opt/quasar-server/secrets/voice.env
+ExecStart=/opt/quasar-server/.venv/bin/uvicorn services.voice_api:app --host 127.0.0.1 --port 31118 --no-access-log
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+MemoryMax=384M
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

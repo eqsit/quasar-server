@@ -13,11 +13,13 @@ export class MusicManager {
   constructor (private readonly backend: MusicBackend) {}
 
   async advanceQueueBackward (deviceId: string): Promise<void> {
+    this.invalidateLookahead(deviceId)
     this.positionCache.delete(deviceId)
     await this.backend.advanceQueueBackward(deviceId)
   }
 
   async advanceQueueForward (deviceId: string): Promise<void> {
+    this.invalidateLookahead(deviceId)
     this.positionCache.delete(deviceId)
     await this.backend.advanceQueueForward(deviceId)
   }
@@ -34,7 +36,7 @@ export class MusicManager {
     recoverCommitToken: string
     track: MusicTrack,
   }> {
-    const nextTrack = await this.backend.getCurrentTrack(deviceId)
+    const nextTrack = await this.backend.getNextTrack(deviceId)
     if (nextTrack === null) {
       return null
     }
@@ -49,7 +51,8 @@ export class MusicManager {
   async recoverCommit (deviceId: string, token: string) {
     if (this.recoverCommitTokensMap.get(deviceId) === token) {
       this.recoverCommitTokensMap.delete(deviceId)
-      await this.advanceQueueForward(deviceId)
+      this.positionCache.delete(deviceId)
+      await this.backend.advanceQueueAutomatic(deviceId)
     } else {
       this.logger.warn(`Failed to commit recover for ${deviceId}: ${this.recoverCommitTokensMap.get(token)} != ${token}`)
     }
@@ -57,5 +60,9 @@ export class MusicManager {
 
   savePosition (deviceId: string, position: number): void {
     this.positionCache.set(deviceId, position)
+  }
+
+  invalidateLookahead (deviceId: string): void {
+    this.recoverCommitTokensMap.delete(deviceId)
   }
 }

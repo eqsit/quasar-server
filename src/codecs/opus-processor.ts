@@ -13,38 +13,47 @@ interface OpusHead {
 
 export class OpusProcessor {
   private encoder: null | OpusEncoder = null
+  private pending = Buffer.alloc(0)
+  private packetParts: Buffer[] = []
 
   constructor (private readonly onAudioData: (data: Buffer) => Promise<void>,
     private readonly onSampleRate: (sampleRate: number) => Promise<void>) {}
 
   async handleAudioData (audioData: Buffer): Promise<void> {
-    const oggPages = OggParser.parse(audioData)
-    for (const page of oggPages) {
-      await this.handleOpusPage(page)
+    this.pending = Buffer.concat([this.pending, audioData])
+    while (this.pending.length >= 27) {
+      if (this.pending.toString('ascii', 0, 4) !== 'OggS') throw new Error('Not an Ogg stream')
+      const headerLength = 27 + this.pending.readUInt8(26)
+      if (this.pending.length < headerLength) return
+      let pageLength = headerLength
+      for (let index = 27; index < headerLength; index++) pageLength += this.pending.readUInt8(index)
+      if (this.pending.length < pageLength) return
+      const [page] = OggParser.parse(this.pending.subarray(0, pageLength))
+      this.pending = this.pending.subarray(pageLength)
+      await this.handleOpusPage(page!)
     }
   }
 
   private async handleOpusPage (page: OggPage): Promise<void> {
     if (page.pageSequenceNumber === 0) {
-      const head = parseOpusHead(Buffer.concat(page.segments))
-      if (head.channelCount !== 1) {
-        throw new Error(`Unsupported number of channels: ${head.channelCount}`)
-      }
-      this.encoder = new OpusEncoder(head.sampleRate, head.channelCount)
-
-      await this.onSampleRate(head.sampleRate)
-      return
+      this.packetParts = []
     }
-    if (page.pageSequenceNumber === 1) {
-      // skip page
-      return
-    }
-    if (this.encoder === null) {
-      throw new Error("Can't decode Opus without OpusHead before")
-    }
+    // Ogg lacing values describe fragments; a 255-byte segment is not a complete packet.
     for (const segment of page.segments) {
-      const decoded = this.encoder.decode(segment)
-      await this.onAudioData(decoded)
+      this.packetParts.push(segment)
+      if (segment.length === 255) continue
+      const packet = Buffer.concat(this.packetParts)
+      this.packetParts = []
+      if (packet.subarray(0, 8).equals(OPUS_HEAD_BUFFER)) {
+        const head = parseOpusHead(packet)
+        if (head.channelCount !== 1) throw new Error(`Unsupported number of channels: ${head.channelCount}`)
+        // OpusHead's rate is informational. Decode at the recognizer's 16 kHz rate.
+        this.encoder = new OpusEncoder(16000, head.channelCount)
+        await this.onSampleRate(16000)
+      } else if (packet.toString('ascii', 0, 8) !== 'OpusTags') {
+        if (!this.encoder) throw new Error("Can't decode Opus without OpusHead before")
+        await this.onAudioData(this.encoder.decode(packet))
+      }
     }
   }
 }

@@ -1,0 +1,23 @@
+[Unit]
+Description=Quasar Tidal OAuth and music queue API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=quasar
+Group=quasar
+EnvironmentFile=/opt/quasar-server/secrets/tidal.env
+ExecStart=/opt/quasar-server/dist/quasar-tidal --config /var/lib/quasar-tidal/config.json
+Restart=on-failure
+RestartSec=5
+StateDirectory=quasar-tidal
+StateDirectoryMode=0700
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+MemoryMax=192M
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

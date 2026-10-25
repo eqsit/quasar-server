@@ -1,0 +1,22 @@
+[Unit]
+Description=v3rt3p Quasar Server
+After=network-online.target docker.service quasar-voice.service
+Wants=network-online.target quasar-voice.service
+Requires=docker.service
+
+[Service]
+User=quasar
+Group=quasar
+WorkingDirectory=/opt/quasar-server
+ExecStart=/usr/local/bin/node --max-old-space-size=320 /opt/quasar-server/dist/main.cjs
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+MemoryMax=512M
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

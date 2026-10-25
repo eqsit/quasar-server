@@ -42,6 +42,7 @@ export interface TTSBackend {
 }
 
 export interface TTSRequest {
+  deviceId?: string
   parentSpan?: Span
   text: string;
 }
@@ -60,6 +61,9 @@ export abstract class AudioMetadataBackendSession {
 }
 
 export abstract class MusicBackend {
+  async advanceQueueAutomatic (deviceId: string): Promise<void> {
+    await this.advanceQueueForward(deviceId)
+  }
   abstract advanceQueueBackward (deviceId: string): Promise<void>
 
   abstract advanceQueueForward (deviceId: string): Promise<void>
@@ -73,6 +77,11 @@ export abstract class STTBackendSession {
   private callback: null | STTChunkTranscribeCallback = null
 
   abstract close (): void
+
+  // Buffered recognizers must finish their request before the session is closed.
+  async finish (): Promise<void> {}
+
+  async markSpotterEnd (): Promise<void> {}
 
   setCallback (callback: STTChunkTranscribeCallback): void {
     this.callback = callback

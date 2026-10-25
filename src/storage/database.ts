@@ -64,6 +64,10 @@ export class PostgresDatabaseStationInfoStorage implements StationInfoProvider {
     })
   }
 
+  async close (): Promise<void> {
+    await this.dataSource.destroy()
+  }
+
   async updateNameAndQuasarConfig (duid: string, name: string | undefined,
     config: QuasarConfig | undefined): Promise<StationInfo> {
     return toInfo(await this.dataSource.transaction(async manager => {

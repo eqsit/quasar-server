@@ -53,7 +53,7 @@ export interface VoiceInputSpeakerMetadataEvent {
 
 // eslint-disable-next-line unicorn/prefer-event-target
 export class VoiceInputHandler extends EventEmitter<VoiceInputHandlerEvents> {
-  private audioDataQueue: Buffer[] = []
+  private audioDataQueue: (Buffer | 'spotter_end')[] = []
   private audioMetadataSession: AudioMetadataBackendSession | null = null
   private audioSendingLock = new Sema(1)
   private lastTranscribeResult: string = ''
@@ -61,12 +61,18 @@ export class VoiceInputHandler extends EventEmitter<VoiceInputHandlerEvents> {
   private metadata: InputMetadata = {}
   private sttSession: null | STTBackendSession = null
   private voiceSpan: null | Span = null
+  private finalizing = false
+  private generation = 0
+  private initialization: Promise<void> | null = null
 
   constructor (private readonly properties: VoiceInputHandlerProperties) {
     super()
   }
 
   close (): void {
+    this.generation++
+    this.finalizing = false
+    this.initialization = null
     this.audioMetadataSession?.close()
     this.audioMetadataSession = null
     this.sttSession?.close()
@@ -99,10 +105,28 @@ export class VoiceInputHandler extends EventEmitter<VoiceInputHandlerEvents> {
     this.close()
   }
 
+  async handleSpotterEndEvent (): Promise<void> {
+    await this.audioSendingLock.acquire()
+    try {
+      if (this.sttSession) await this.sttSession.markSpotterEnd()
+      else this.audioDataQueue.push('spotter_end')
+    } finally {
+      this.audioSendingLock.release()
+    }
+  }
+
   async handleVoiceInputEvent (request: VoiceInputEvent): Promise<void> {
     this.logger.debug('VoiceInputHandler received Input')
     this.close()
+    const generation = this.generation
+    this.metadata = { ...request.metadata }
+    const pending = this.initialize(request, generation)
+    this.initialization = pending
+    await pending
+    if (generation === this.generation) this.initialization = null
+  }
 
+  private async initialize (request: VoiceInputEvent, generation: number): Promise<void> {
     if (request.parentSpan) {
       this.voiceSpan = startInactiveSpan({
         name: 'VoiceInputHandler processing',
@@ -120,6 +144,7 @@ export class VoiceInputHandler extends EventEmitter<VoiceInputHandlerEvents> {
         this.properties.stt.startTranscribing(this.voiceSpan ?? undefined)
       ])
     } catch (error) {
+      if (generation !== this.generation) return
       this.emit('error', {
         error
       })
@@ -127,20 +152,20 @@ export class VoiceInputHandler extends EventEmitter<VoiceInputHandlerEvents> {
       return
     }
 
+    if (generation !== this.generation) {
+      audioMetadataSession.close()
+      sttSession.close()
+      return
+    }
+
     sttSession.setCallback(({ endOfUtt, text }) => {
+      if (generation !== this.generation) return
       this.lastTranscribeResult = text
       this.emit('transcribed', {
         text
       })
       this.logger.debug(`VoiceInputHandler transcribed: ${text}`)
-      if (endOfUtt) {
-        this.stop().then(() => {
-          this.transcribeFinished()
-        }).catch(error => {
-          this.emit('error', error)
-          this.close()
-        })
-      }
+      if (endOfUtt) void this.complete(false)
     })
 
     this.logger.debug('VoiceInputHandler streams created')
@@ -151,7 +176,8 @@ export class VoiceInputHandler extends EventEmitter<VoiceInputHandlerEvents> {
         const copy = [...this.audioDataQueue]
 
         for (const data of copy) {
-          await Promise.all([audioMetadataSession.processChunk(data), sttSession.transcribeChunk(data)])
+          if (data === 'spotter_end') await sttSession.markSpotterEnd()
+          else await Promise.all([audioMetadataSession.processChunk(data), sttSession.transcribeChunk(data)])
         }
         this.logger.debug(`Sent ${this.audioDataQueue.length} chunks`)
         this.audioDataQueue = this.audioDataQueue.slice(copy.length)
@@ -168,8 +194,30 @@ export class VoiceInputHandler extends EventEmitter<VoiceInputHandlerEvents> {
 
   async handleVoiceInputFinishEvent (_request: VoiceInputFinishEvent): Promise<void> {
     this.logger.debug('VoiceInputHandler received Finish')
-    await this.stop()
-    this.transcribeFinished()
+    await this.complete(true)
+  }
+
+  private async complete (flush: boolean): Promise<void> {
+    if (this.finalizing) return
+    this.finalizing = true
+    const generation = this.generation
+    try {
+      await this.initialization
+      if (generation !== this.generation) return
+      await this.audioSendingLock.acquire()
+      try {
+        if (flush) await this.sttSession?.finish()
+        if (generation !== this.generation) return
+        await this.stop()
+        if (generation === this.generation) this.transcribeFinished()
+      } finally {
+        this.audioSendingLock.release()
+      }
+    } catch (error) {
+      if (generation !== this.generation) return
+      this.emit('error', { error })
+      this.close()
+    }
   }
 
   async handleVoiceInputSpeakerMetadataEvent (request: VoiceInputSpeakerMetadataEvent): Promise<void> {

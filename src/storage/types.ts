@@ -3,7 +3,8 @@ import z from 'zod'
 const rawQuasarConfig = z.object({
   accountConfig: z.object({
     aliceAdaptiveVolume: z.object({
-      enabled: z.boolean().default(true),
+      // Owner asked for manual volume only: no adaptive loudness on its own.
+      enabled: z.boolean().default(false),
     }),
     aliceProactivity: z.boolean().default(true),
     alwaysOnMicForShortcuts: z.boolean().default(false),
@@ -259,7 +260,7 @@ const rawQuasarConfig = z.object({
     sendVinsRequestProto: z.boolean().default(true),
     shouldCheckWifi: z.boolean().default(false),
     smartVolume: z.object({
-      enabled: z.boolean().default(true)
+      enabled: z.boolean().default(false)
     }),
     teleme3d: z.object({
       appmetrica: z.object({
